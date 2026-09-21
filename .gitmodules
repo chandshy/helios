@@ -6,7 +6,7 @@
 	url = https://github.com/winboat-org/LookingGlass.git
 [submodule "dxvk-helios"]
 	path = dxvk-helios
-	url = https://github.com/winboat-org/dxvk.git
+	url = https://github.com/chandshy/dxvk.git
 [submodule "vkd3d-proton-helios"]
 	path = vkd3d-proton-helios
 	url = https://github.com/winboat-org/vkd3d-proton.git
