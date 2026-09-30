@@ -403,6 +403,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 /// `DxgkDdiStopDevice` — quiesce the adapter (inverse of StartDevice).
 pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: StopDevice\n");
+    crate::diag::record_named_bytes(b"StpStg", 1);
     if !miniport_device_context.is_null() {
         // SHARED borrow, for the same reason StartDevice takes one: the ISR and
         // the DPCs can still build `&AdapterContext` from this pointer while this
@@ -434,39 +435,27 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // the (about-to-be-torn-down) context.
         adapter.stop_vsync();
         adapter.stop_hpd();
+        crate::diag::record_named_bytes(b"StpStg", 2);
         // AFTER stop_hpd, so the worker can no longer re-publish into the state
         // we are about to clear. Every scanout identity below belongs to the
         // transport generation being torn down; carrying it into the next
         // StartDevice is how a latched gate kills CRTC_VSYNC and how a recycled
         // resource id gets bound as the cached scan-out target.
         adapter.reset_display_publication_state();
+        crate::diag::record_named_bytes(b"StpStg", 3);
 
-        // SAFETY: `DxgkDdiStopDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
-        // DXGKDDI_STOP_DEVICE); the teardown below unrefs blobs and destroys the
-        // venus context, both control round-trips against the still-live device.
-        let passive_stop = unsafe { crate::irql::PassiveLevel::assume() };
-
-        // Tear down the venus client + page-table blob + context BEFORE dropping
-        // the transport (the unref/detach/destroy commands need the live device).
-        // Drop the client first to unmap its ring/reply BAR kernel mappings.
-        let venus_ctx = adapter.venus_ctx_id();
+        // StopDevice must not wait on best-effort host cleanup: during shutdown
+        // the host may already have stopped servicing synchronous virtio control
+        // round-trips. Drop the client mappings, then reset the transport; reset
+        // destroys the host contexts/resources and frees in-flight/parked buffers.
         adapter.set_venus_client(None); // Drop → MmUnmapIoSpace ring + reply mappings.
-        if venus_ctx != 0 {
-            // Best-effort: unref every KMD-internal blob (owner 0) and destroy the
-            // venus context (PASSIVE flows through virtio::ctrl).
-            // The KMD-owned sweep — `None` here means exactly the KMD's own blobs, not
-            // "every owner".
-            let _ = crate::virtio::ctrl::release_blobs_for_owner(passive_stop, adapter, None);
-            let _ = crate::virtio::ctrl::ctx_destroy_kmd(passive_stop, adapter, venus_ctx);
-        }
-        // Free any parked completed entries at PASSIVE before the transport
-        // (and the buffers still in flight inside it) is dropped.
-        crate::virtio::ctrl::reap_parked(passive_stop, adapter);
+        crate::diag::record_named_bytes(b"StpStg", 4);
 
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
         // frees its rings (plus any in-flight/parked entry buffers). A later
         // StartDevice re-initializes.
         adapter.set_virtio(None);
+        crate::diag::record_named_bytes(b"StpStg", 5);
 
         // Drop the whole transport generation in one store — `bar_segment` and
         // `venus_ctx_id` together, since both are meaningless in the next
@@ -480,7 +469,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // SAFETY: StopDevice, PASSIVE_LEVEL, serialized by dxgkrnl against
         // StartDevice and against every DDI that reads the generation.
         unsafe { adapter.set_transport_generation(None) };
+        crate::diag::record_named_bytes(b"StpStg", 6);
     }
+    crate::diag::record_named_bytes(b"StpStg", 7);
     STATUS_SUCCESS
 }
 
