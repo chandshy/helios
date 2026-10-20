@@ -1,0 +1,50 @@
+--- a/src/dxvk/dxvk_queue.cpp
++++ b/src/dxvk/dxvk_queue.cpp
+@@ -7,9 +7,7 @@
+   DxvkSubmissionQueue::DxvkSubmissionQueue(DxvkDevice* device, const DxvkQueueCallback& callback)
+   : m_device        (device),
+     m_checkpoints   (device->getCheckpointBuffer()),
+-    m_callback      (callback),
+-    m_submitThread  ([this] () { submitCmdLists(); }),
+-    m_finishThread  ([this] () { finishCmdLists(); }) {
++    m_callback      (callback) {
+     auto vk = m_device->vkd();
+ 
+     VkSemaphoreTypeCreateInfo semaphoreType = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+@@ -21,8 +19,34 @@
+     VkResult vrTransfer = vk->vkCreateSemaphore(vk->device(), &semaphoreInfo, nullptr, &m_semaphores.transfer);
+ 
+     if (vrGraphics || vrTransfer) {
+-      throw DxvkError(str::format("Failed to create timeline semaphores: ",
+-        vrGraphics > vrTransfer ? vrGraphics : vrTransfer));
++      if (!vrGraphics)
++        vk->vkDestroySemaphore(vk->device(), m_semaphores.graphics, nullptr);
++      if (!vrTransfer)
++        vk->vkDestroySemaphore(vk->device(), m_semaphores.transfer, nullptr);
++
++      throw DxvkError(str::format("Failed to create timeline semaphores: graphics=",
++        vrGraphics, ", transfer=", vrTransfer));
++    }
++
++    try {
++      m_submitThread = dxvk::thread([this] () { submitCmdLists(); });
++      m_finishThread = dxvk::thread([this] () { finishCmdLists(); });
++    } catch (...) {
++      { std::unique_lock<dxvk::mutex> lock(m_mutex);
++        m_stopped.store(true);
++      }
++
++      m_appendCond.notify_all();
++      m_submitCond.notify_all();
++
++      if (m_submitThread.joinable())
++        m_submitThread.join();
++      if (m_finishThread.joinable())
++        m_finishThread.join();
++
++      vk->vkDestroySemaphore(vk->device(), m_semaphores.graphics, nullptr);
++      vk->vkDestroySemaphore(vk->device(), m_semaphores.transfer, nullptr);
++      throw;
+     }
+   }
+   
