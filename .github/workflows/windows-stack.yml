@@ -1,140 +1,81 @@
-name: Unsigned UMD candidate compile proof
-
+name: SE2 SDK diagnostic only
 on:
   workflow_dispatch:
-
+    inputs:
+      spend_authorization:
+        description: 'Type USD0.01 for this single evidence-only job; no signing or trust changes.'
+        required: true
+        type: string
 permissions:
   contents: read
-
+  actions: read
 env:
   GIT_CONFIG_COUNT: '1'
   GIT_CONFIG_KEY_0: core.autocrlf
   GIT_CONFIG_VALUE_0: 'false'
   GIT_TERMINAL_PROMPT: '0'
-
+  SE2_SPEND_AUTHORIZATION: ${{ inputs.spend_authorization }}
+  SE2_REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
 concurrency:
-  group: unsigned-umd-${{ github.ref }}
+  group: se2-b-package-only
   cancel-in-progress: false
-
 jobs:
-  regression:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      candidate_sha: ${{ steps.regression.outputs.candidate_sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          fetch-depth: 2
-          submodules: false
-          persist-credentials: false
-      - name: Verify exact publication inputs
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import hashlib, os, pathlib, subprocess
-          r=pathlib.Path('.')
-          assert subprocess.check_output(['git','rev-parse','HEAD^'],text=True).strip()=='7e0e6b73c140b919dde20679e65e3a23dae40764'
-          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==os.environ['GITHUB_SHA']
-          expected={'ci/windows/Build-SE2UmdCandidate.ps1': 'cdb34f59d584d0b2a4b6b0d853204885dda940d71dbfcc66bf484c8014e281b1', 'umd/bridge/dxvk_bridge.cpp': '859fda0bd105417c05fef74af7773937855c98ee59092dfb397e73da6f9e591e', 'ci/windows/tests/queue-unwind-regression.py': 'd111cef1f5a33bf8a1fb1adf12eeb75cb1c8459c9beb9b9508eaff6b5c7140c2', 'ci/windows/patches/dxvk-queue-unwind.patch': 'c8445d367110dd28fa4abdf24fa0db00e62e6688b1557a96deccae8d08e939ab'}
-          allowed=sorted(['.github/workflows/windows-stack.yml',*expected])
-          actual=sorted(subprocess.check_output(['git','diff','--name-only','HEAD^','HEAD'],text=True).splitlines())
-          assert actual==allowed,(actual,allowed)
-          for n,h in expected.items():assert hashlib.sha256((r/n).read_bytes()).hexdigest()==h,n
-          PY
-      - name: Initialize frozen DXVK source
-        shell: bash
-        run: git submodule update --init --recursive dxvk-helios
-      - name: Qualify source and run host regression
-        id: regression
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git -C dxvk-helios rev-parse HEAD)" = 316a457fb247ca1f9d99aa5a47963eadb06f693c
-          git -C dxvk-helios show 316a457fb247ca1f9d99aa5a47963eadb06f693c:src/dxvk/dxvk_queue.cpp > "$RUNNER_TEMP/queue-original.cpp"
-          git -C dxvk-helios apply --check "$GITHUB_WORKSPACE/ci/windows/patches/dxvk-queue-unwind.patch"
-          git -C dxvk-helios apply "$GITHUB_WORKSPACE/ci/windows/patches/dxvk-queue-unwind.patch"
-          python3 ci/windows/tests/queue-unwind-regression.py --candidate dxvk-helios/src/dxvk/dxvk_queue.cpp --original "$RUNNER_TEMP/queue-original.cpp" --output "$RUNNER_TEMP/queue-regression"
-          test "$(stat -c %s "$RUNNER_TEMP/queue-regression/proof.json")" -le 1048576
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: queue-regression-proof
-          path: ${{ runner.temp }}/queue-regression/proof.json
-          if-no-files-found: error
-          retention-days: 1
-
-  compile_umd:
-    needs: regression
+  tool-diagnostic:
+    if: ${{ github.event.repository.visibility == 'public' && github.repository == 'chandshy/helios' && github.run_attempt == 1 }}
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 2
           submodules: false
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: '3.12'
-      - name: Verify exact publication inputs
-        shell: python
-        run: |
-          import hashlib, os, pathlib, subprocess
-          r=pathlib.Path('.')
-          assert subprocess.check_output(['git','rev-parse','HEAD^'],text=True).strip()=='7e0e6b73c140b919dde20679e65e3a23dae40764'
-          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==os.environ['GITHUB_SHA']
-          expected={'ci/windows/Build-SE2UmdCandidate.ps1': 'cdb34f59d584d0b2a4b6b0d853204885dda940d71dbfcc66bf484c8014e281b1', 'umd/bridge/dxvk_bridge.cpp': '859fda0bd105417c05fef74af7773937855c98ee59092dfb397e73da6f9e591e', 'ci/windows/tests/queue-unwind-regression.py': 'd111cef1f5a33bf8a1fb1adf12eeb75cb1c8459c9beb9b9508eaff6b5c7140c2', 'ci/windows/patches/dxvk-queue-unwind.patch': 'c8445d367110dd28fa4abdf24fa0db00e62e6688b1557a96deccae8d08e939ab'}
-          allowed=sorted(['.github/workflows/windows-stack.yml',*expected])
-          actual=sorted(subprocess.check_output(['git','diff','--name-only','HEAD^','HEAD'],text=True).splitlines())
-          assert actual==allowed,(actual,allowed)
-          for n,h in expected.items():assert hashlib.sha256((r/n).read_bytes()).hexdigest()==h,n
-          assert os.environ['REGRESSION_SHA']=='574b4b898ba6c492da326879e74fd3e9fd13196d7320cd85a54e2c6c598dcd52'
-        env:
-          REGRESSION_SHA: ${{ needs.regression.outputs.candidate_sha }}
-      - name: Initialize frozen DXVK source
+      - name: Observe exact preinstalled SDK and WDK metadata only
+        shell: pwsh
+        run: ./ci/windows/Package-SE2BDriver.ps1 -Mode ToolDiagnostic -RepoRoot $env:GITHUB_WORKSPACE
+      - name: Read original Inf2Cat Authenticode policy error
+        if: ${{ always() }}
         shell: pwsh
         run: |
-          git submodule update --init --recursive dxvk-helios
-          if ($LASTEXITCODE -ne 0) { throw 'DXVK checkout failed.' }
-      - name: Prepare Python build tools
+          . ./ci/windows/Package-SE2BDriver.ps1 -Mode Functions -RepoRoot $env:GITHUB_WORKSPACE
+          Assert-Source
+          $null=Assert-Admission
+          $artifactDir=Join-Path $env:RUNNER_TEMP 'se2-b-public-diagnostic'
+          Require (Test-Path -LiteralPath $artifactDir -PathType Container) 'STOP_DIAGNOSTIC_DIRECTORY'
+          Save-Json @{sourceCommit=$env:GITHUB_SHA;runID=$env:GITHUB_RUN_ID;status='not-run';reason='verifier-prerequisite-not-admitted';targetExecuted=$false;keysOrTrustChanged=$false} (Join-Path $artifactDir 'se2-b-inf2cat-verification.json')
+          $signTool=Assert-Tool 'SignTool' $ToolSpecs.SignTool
+          Recheck-Tool $signTool
+          $target=Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin/10.0.26100.0/x86/Inf2Cat.exe'
+          Require ((Hash $target) -ceq '31fd4bef7237be82e3684503b248eeeb906ebce8a94ccf9f1a8254f00db1ebca') 'STOP_ORIGINAL_INF2CAT_CHANGED'
+          $previousNativePreference=$PSNativeCommandUseErrorActionPreference
+          try {
+            $PSNativeCommandUseErrorActionPreference=$false
+            $output=(& $signTool.path verify /pa /all /v /debug $target 2>&1 | Out-String)
+            $exit=$LASTEXITCODE
+          } finally { $PSNativeCommandUseErrorActionPreference=$previousNativePreference }
+          Require ($output.Length -le 262144) 'STOP_VERIFIER_OUTPUT_SIZE'
+          Require ((Hash $target) -ceq '31fd4bef7237be82e3684503b248eeeb906ebce8a94ccf9f1a8254f00db1ebca') 'STOP_ORIGINAL_INF2CAT_CHANGED'
+          Save-Json @{sourceCommit=$env:GITHUB_SHA;runID=$env:GITHUB_RUN_ID;runAttempt=$env:GITHUB_RUN_ATTEMPT;toolSha256=$signTool.sha256;targetSha256=(Hash $target);policy='verify /pa /all /v /debug';exitCode=$exit;output=$output;targetExecuted=$false;keysOrTrustChanged=$false} (Join-Path $artifactDir 'se2-b-inf2cat-verification.json')
+      - name: Admit exact bounded public diagnostics
+        id: diagnostic_upload_admission
+        if: ${{ always() }}
         shell: pwsh
         run: |
-          python -m pip install 'meson==1.11.2' ninja
-          if ($LASTEXITCODE -ne 0) { throw 'Build tool setup failed.' }
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+          . ./ci/windows/Package-SE2BDriver.ps1 -Mode Functions
+          try {
+            Assert-DiagnosticArtifact "$env:RUNNER_TEMP/se2-b-public-diagnostic"
+            'admitted=true' >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Host 'SE2_DIAGNOSTIC_UPLOAD_WITHHELD: exact regular files or aggregate byte bound rejected.'
+            throw
+          }
+      - name: Retain strict public tool admission diagnostics
+        if: ${{ always() && steps.diagnostic_upload_admission.conclusion == 'success' && steps.diagnostic_upload_admission.outputs.admitted == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          toolchain: nightly-2026-07-14
-      - name: Prepare pinned standalone shader compiler
-        shell: python
-        run: |
-          import hashlib, os, pathlib, urllib.request, zipfile
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'glslang-16.6.0'
-          assert not root.exists(), 'Shader tool root must be fresh'
-          url = 'https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip'
-          with urllib.request.urlopen(url, timeout=60) as response:
-              data = response.read(13734780)
-          assert len(data) == 13734779
-          assert hashlib.sha256(data).hexdigest() == '82bf434e69b9bb4829de7e2b4bc2c5e7a7861e53d66cf75e5cc70f5f694a8d9b'
-          archive = root.with_suffix('.zip')
-          archive.write_bytes(data)
-          with zipfile.ZipFile(archive) as source:
-              for name in source.namelist():
-                  assert not pathlib.PurePosixPath(name).is_absolute() and '..' not in pathlib.PurePosixPath(name).parts and ':' not in name and chr(92) not in name
-              source.extractall(root)
-          compiler = root / 'bin' / 'glslang.exe'
-          assert hashlib.sha256(compiler.read_bytes()).hexdigest() == '9643709c02c83e26773f96b6a87f197ab2e84f78be0879ad8fb3619418b5d9ad'
-          with open(os.environ['GITHUB_PATH'], 'a', encoding='utf-8') as output:
-              output.write(str(compiler.parent) + '\n')
-      - name: Compile unsigned UMD and inspect PE proof
-        shell: pwsh
-        run: ./ci/windows/Build-SE2UmdCandidate.ps1 -RepoRoot $env:GITHUB_WORKSPACE -BuildRoot "$env:RUNNER_TEMP/umd-candidate-build" -OutputDir "$env:RUNNER_TEMP/umd-candidate-proof"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: unsigned-umd-compile-proof
+          name: se2-b-tool-admission-public
           path: |
-            ${{ runner.temp }}/umd-candidate-proof/helios_umd.dll
-            ${{ runner.temp }}/umd-candidate-proof/proof.json
-            ${{ runner.temp }}/umd-candidate-proof/imports.txt
-            ${{ runner.temp }}/umd-candidate-proof/exports.txt
+            ${{ runner.temp }}/se2-b-public-diagnostic/se2-b-tool-admission.json
+            ${{ runner.temp }}/se2-b-public-diagnostic/se2-b-inf2cat-verification.json
           if-no-files-found: error
           retention-days: 1
