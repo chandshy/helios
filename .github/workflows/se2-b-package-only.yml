@@ -1,0 +1,73 @@
+name: SE2 B package only (future spend authorization required)
+
+on:
+  workflow_dispatch:
+    inputs:
+      spend_authorization:
+        description: 'Future incremental spend authorization: type USD0.01. Not an account hard cap.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GIT_CONFIG_COUNT: '1'
+  GIT_CONFIG_KEY_0: core.autocrlf
+  GIT_CONFIG_VALUE_0: 'false'
+  GIT_TERMINAL_PROMPT: '0'
+  SE2_SPEND_AUTHORIZATION: ${{ inputs.spend_authorization }}
+  SE2_REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+
+concurrency:
+  group: se2-b-package-only
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: ${{ github.event.repository.visibility == 'public' && github.repository == 'chandshy/helios' && github.run_attempt == 1 }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          submodules: false
+          persist-credentials: false
+      # Future manual input authorizes incremental spend only; account hard cap remains unverified.
+      # No installs, winget, source/package agreement acceptance, secrets or dispatch override.
+      - name: Admit exact source and future spend boundary
+        shell: pwsh
+        run: ./ci/windows/Package-SE2BDriver.ps1 -Mode Admission -RepoRoot $env:GITHUB_WORKSPACE
+      - name: Retrieve exact retained unsigned artifact
+        shell: cmd
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api repos/chandshy/helios/actions/artifacts/12339493024/zip > "%RUNNER_TEMP%\se2-b-unsigned.zip"
+      - name: Validate input identities and package
+        shell: pwsh
+        run: ./ci/windows/Package-SE2BDriver.ps1 -Mode Package -RepoRoot $env:GITHUB_WORKSPACE -UnsignedZip "$env:RUNNER_TEMP/se2-b-unsigned.zip" -WorkRoot "$env:RUNNER_TEMP/se2-b-package"
+      - name: Verify exact owned key and trust cleanup
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./ci/windows/Package-SE2BDriver.ps1 -Mode Cleanup -WorkRoot "$env:RUNNER_TEMP/se2-b-package"
+      - name: Recheck public output allowlist
+        shell: pwsh
+        run: |
+          . ./ci/windows/Package-SE2BDriver.ps1 -Mode Functions
+          Assert-Output "$env:RUNNER_TEMP/se2-b-package/public"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: se2-b-core-package-public
+          path: |
+            ${{ runner.temp }}/se2-b-package/public/helios_kmd_render.inf
+            ${{ runner.temp }}/se2-b-package/public/helios_kmd_render.sys
+            ${{ runner.temp }}/se2-b-package/public/helios_umd.dll
+            ${{ runner.temp }}/se2-b-package/public/helios_kmd_render.cat
+            ${{ runner.temp }}/se2-b-package/public/public.cer
+            ${{ runner.temp }}/se2-b-package/public/proof.json
+            ${{ runner.temp }}/se2-b-package/public/verification.log
+            ${{ runner.temp }}/se2-b-package/public/cleanup-proof.json
+          if-no-files-found: error
+          retention-days: 1
