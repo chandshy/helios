@@ -133,6 +133,17 @@ jobs:
       - name: Initialize Mesa fork
         shell: pwsh
         run: git submodule update --init icd/mesa
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      # MSYS2 trimmed its mingw32 repository: python-mako, python-yaml,
+      # vulkan-headers and vulkan-loader no longer exist for i686. Mesa needs
+      # no system Vulkan here (it uses its in-tree include/vulkan; only the
+      # zink check_requirements tool, which this build does not enable, wants
+      # the loader), so those two are simply dropped. Mako/MarkupSafe/PyYAML
+      # are pure Python with optional C speedups, so the pinned wheels are
+      # installed into the MINGW32 interpreter's site-packages by the runner's
+      # pip and run on their pure-Python fallbacks.
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
         with:
           msystem: MINGW32
@@ -143,14 +154,17 @@ jobs:
             mingw-w64-i686-meson
             mingw-w64-i686-ninja
             mingw-w64-i686-python
-            mingw-w64-i686-python-mako
             mingw-w64-i686-python-packaging
-            mingw-w64-i686-python-yaml
             mingw-w64-i686-pkgconf
-            mingw-w64-i686-vulkan-headers
-            mingw-w64-i686-vulkan-loader
             bison
             flex
+      - name: Install Mesa Python modules for the MINGW32 interpreter
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          site="$(cygpath -m "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')")"
+          "$(cygpath -u "$pythonLocation")/python.exe" -m pip install --disable-pip-version-check --no-deps --target "$site" Mako==1.3.10 MarkupSafe==3.0.2 PyYAML==6.0.2
+          python -c 'import mako, markupsafe, yaml; print("mako", mako.__version__, "markupsafe", markupsafe.__version__, "yaml", yaml.__version__)'
       - name: Build WoW64 Mesa runtime
         shell: msys2 {0}
         run: bash ./ci/windows/build-mesa.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/helios-mesa-x86"
