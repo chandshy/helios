@@ -52,9 +52,16 @@ pub(crate) fn request_wddm_completion_dpc(adapter: &AdapterContext) {
 /// is outstanding. Keeping fence retirement here prevents an opportunistic drain
 /// from consuming a Venus completion without notifying VidSch.
 ///
+/// Returns the number of `DXGK_INTERRUPT_DMA_COMPLETED` packets actually
+/// delivered through `DxgkCbNotifyInterrupt` during this call (stale-skipped
+/// fences do not count). The DPC uses a zero return to skip `DxgkCbNotifyDpc`
+/// so it cannot park inside VidSch's scheduler lock when there is nothing for
+/// the worker to observe (Round 9/10 livelock).
+///
 /// The bind application lives HERE rather than in `drain_used` because of the
 /// lock order — see the comment on it below.
-pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
+pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) -> u32 {
+    let mut reported = 0u32;
     let _ = adapter.with_virtio(|v| v.drain_used());
 
     // A producer completion may have made the one deferred fast bind safe.
@@ -259,10 +266,18 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             };
             // SAFETY: the WDDM notification lock is held; the helper
             // raises to DIRQL for the callback without re-locking.
+            let before_notify = super::submit_command::DMA_NOTIFY_COUNT.load(Ordering::Relaxed);
             let status = unsafe {
                 super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
             };
+            let after_notify = super::submit_command::DMA_NOTIFY_COUNT.load(Ordering::Relaxed);
             if status == STATUS_SUCCESS {
+                // Only a real DxgkCbNotifyInterrupt (forward fence) should
+                // count: a stale-skip also returns STATUS_SUCCESS but queues
+                // no packet, and must not push us into NotifyDpc.
+                if after_notify != before_notify {
+                    reported = reported.saturating_add(1);
+                }
                 let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
                 if let Some(prefix) = terminal_prefix {
@@ -270,9 +285,8 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                     // only after dxgkrnl accepted the DMA completion. A
                     // callback failure requeues the WDDM entry without
                     // having to reconstruct terminal membership.
-                    let _ = guard.with_virtio(|_o, v| {
-                        v.consume_windowed_blt_terminal_prefix(prefix)
-                    });
+                    let _ =
+                        guard.with_virtio(|_o, v| v.consume_windowed_blt_terminal_prefix(prefix));
                 }
                 continue;
             }
@@ -295,6 +309,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
         let _ = adapter.with_virtio(|v| v.release_fast_owned_worker(request));
         adapter.signal_hpd();
     }
+    reported
 }
 
 /// `DxgkDdiInterruptRoutine` — runs at the device's DIRQL; returns TRUE if the
@@ -389,16 +404,39 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     //
     // drain_used_and_complete takes only Helios locks (virtio device lock,
     // wddm_notify_lock) and never dxgkrnl's, and neither is held across the
-    // NotifyDpc call below, so no new lock-order edge is introduced. Packets it
-    // queues are consumed by the NotifyDpc call right after (and the notify
-    // routine's own DxgkCbQueueDpc still re-runs this DPC as before).
-    drain_used_and_complete(adapter);
-
-    if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
-        if let Some(notify_dpc) = dxgkrnl.DxgkCbNotifyDpc {
-            // SAFETY: DISPATCH_LEVEL DPC context; live device handle.
-            unsafe { notify_dpc(dxgkrnl.DeviceHandle) };
+    // NotifyDpc call below, so no new lock-order edge is introduced.
+    //
+    // ROUND 9 / 10: do not call NotifyDpc when this drain reported no
+    // DMA_COMPLETED packets. NotifyDpc acquires the VidSch scheduler
+    // spinlock; the worker may already hold it while polling ISR-side
+    // state via KeSynchronizeExecution (freeze-probe3-run20: CPU 2 in
+    // VidSchDdiNotifyDpc+0x1df, CPU 4 in KeSynchronizeExecution inside
+    // SelectContext). If we park this DPC in that wait, it never returns,
+    // so a later virtio used-ring interrupt can only DxgkCbQueueDpc and
+    // cannot be drained. Skipping NotifyDpc on a zero report lets the DPC
+    // finish; a later ISR can queue a fresh one. After a non-zero report,
+    // ISR-side state is already updated, so the worker can drop the lock
+    // and NotifyDpc can complete; then drain once more in case used-ring
+    // entries arrived while NotifyDpc ran. Bounded to the WDDM FIFO depth
+    // so a pathological notify loop cannot spin the DPC forever.
+    //
+    // Packets a non-zero drain queues are consumed by the NotifyDpc call
+    // right after (and the notify routine's own DxgkCbQueueDpc still
+    // re-runs this DPC as before).
+    const MAX_NOTIFY_PASSES: u32 = 256;
+    for _ in 0..MAX_NOTIFY_PASSES {
+        let reported = drain_used_and_complete(adapter);
+        if reported == 0 {
+            return;
         }
+        if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+            if let Some(notify_dpc) = dxgkrnl.DxgkCbNotifyDpc {
+                // SAFETY: DISPATCH_LEVEL DPC context; live device handle.
+                unsafe { notify_dpc(dxgkrnl.DeviceHandle) };
+                continue;
+            }
+        }
+        return;
     }
 }
 

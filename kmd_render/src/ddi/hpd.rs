@@ -216,7 +216,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             // flag signals the event we just woke on.
             || adapter.scanout_retire_wanted.swap(0, Ordering::AcqRel) != 0
         {
-            crate::ddi::interrupt::drain_used_and_complete(adapter);
+            let _ = crate::ddi::interrupt::drain_used_and_complete(adapter);
         }
 
         // The ISR owns setting this bit; the PASSIVE worker consumes it after
