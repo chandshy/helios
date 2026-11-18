@@ -88,6 +88,23 @@ impl WddmNotifyGuard<'_> {
             .store(fence, Ordering::Release);
     }
 
+    /// The PreemptionFenceId of a DxgkDdiPreemptCommand request that has not
+    /// been acknowledged with DMA_PREEMPTED yet.
+    pub(crate) fn pending_preempt(&self) -> Option<u32> {
+        helios_kmd_logic::preempt_ack::unpack(self.adapter.pending_preempt.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_pending_preempt(&self, preemption_fence: u32) {
+        self.adapter.pending_preempt.store(
+            helios_kmd_logic::preempt_ack::pack(preemption_fence),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn clear_pending_preempt(&self) {
+        self.adapter.pending_preempt.store(0, Ordering::Release);
+    }
+
     /// Run `f` against this adapter's transport with the notify lock already
     /// held, handing it the [`NotifyOrdered`] token the ordered transport
     /// methods require.

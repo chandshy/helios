@@ -443,6 +443,11 @@ pub struct AdapterContext {
     started_published: AtomicU32,
     /// Last fence completed by the bring-up scheduler path.
     last_completed_fence: AtomicU32,
+    /// Deferred DxgkDdiPreemptCommand request (22.22.259.9004):
+    /// `helios_kmd_logic::preempt_ack` word, 0 = none, else pending bit |
+    /// PreemptionFenceId. Read and written only under `wddm_notify_lock`
+    /// (through [`WddmNotifyGuard`]); atomic only so the field is `Sync`.
+    pub(crate) pending_preempt: AtomicU64,
     /// Serializes DMA_COMPLETED notification and its monotonic fence update.
     /// A DPC can take an older ready fence out of the virtio FIFO while a new
     /// SubmitCommand concurrently takes the immediate-completion path; without
@@ -1063,6 +1068,7 @@ impl AdapterContext {
             started: UnsafeCell::new(None),
             started_published: AtomicU32::new(0),
             last_completed_fence: AtomicU32::new(0),
+            pending_preempt: AtomicU64::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
             virtio_lock: UnsafeCell::new(0),

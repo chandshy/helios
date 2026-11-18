@@ -5187,3 +5187,82 @@ mod snapshot_bind_tests {
         );
     }
 }
+
+/// Deferred `DXGK_INTERRUPT_DMA_PREEMPTED` acknowledgement (22.22.259.9004).
+///
+/// Helios cannot stop host venus work mid-buffer, so it is a DMA-buffer-boundary
+/// preemption engine whose "boundary" is the end of everything already submitted.
+/// The WDK (`DxgkDdiPreemptCommand` remarks) allows the driver to notify the
+/// preemption from inside the DDI only when the hardware has already finished
+/// every submitted DMA buffer and those completions were reported; otherwise the
+/// preemption is reported later, from the interrupt path, with
+/// `LastCompletedFenceId` = the last fence the hardware really completed.
+pub mod preempt_ack {
+    use crate::scanout_lease::fence_is_forward;
+
+    /// Packed "pending preemption" word kept on the adapter: 0 = none,
+    /// otherwise `PENDING_BIT | PreemptionFenceId`.
+    pub const PENDING_BIT: u64 = 1 << 32;
+
+    pub const fn pack(preemption_fence: u32) -> u64 {
+        PENDING_BIT | preemption_fence as u64
+    }
+
+    pub const fn unpack(word: u64) -> Option<u32> {
+        if word & PENDING_BIT != 0 {
+            Some(word as u32)
+        } else {
+            None
+        }
+    }
+
+    /// May the pending preemption be acknowledged now?
+    ///
+    /// `head` is the oldest still-pending (submitted, not yet reported
+    /// complete) WDDM fence, or `None` when every submitted fence has been
+    /// reported. Every fence submitted BEFORE the preemption request must have
+    /// been reported first; a head that is forward of the preemption fence was
+    /// submitted after the request and does not hold the acknowledgement back.
+    pub const fn ready(preemption_fence: u32, head: Option<u32>) -> bool {
+        match head {
+            None => true,
+            Some(h) => fence_is_forward(preemption_fence, h),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pack_round_trips_including_zero_fence() {
+            assert_eq!(unpack(0), None);
+            assert_eq!(unpack(pack(0)), Some(0));
+            assert_eq!(unpack(pack(0x17b)), Some(0x17b));
+            assert_eq!(unpack(pack(u32::MAX)), Some(u32::MAX));
+        }
+
+        #[test]
+        fn drained_fifo_acks() {
+            assert!(ready(100, None));
+        }
+
+        #[test]
+        fn older_pending_fence_holds_the_ack() {
+            assert!(!ready(100, Some(98)));
+            assert!(!ready(100, Some(99)));
+            assert!(!ready(100, Some(100)));
+        }
+
+        #[test]
+        fn fence_submitted_after_request_does_not_hold_the_ack() {
+            assert!(ready(100, Some(101)));
+        }
+
+        #[test]
+        fn wraps() {
+            assert!(!ready(5, Some(u32::MAX - 1)));
+            assert!(ready(u32::MAX, Some(2)));
+        }
+    }
+}
