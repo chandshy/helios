@@ -367,19 +367,39 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
         adapter.signal_hpd();
     }
 
-    // Let dxgkrnl process any interrupt data queued by DxgkCbNotifyInterrupt
-    // (the WDDM fence completions signaled below re-queue this DPC, and this
-    // call drains their packets — the viogpu3d NotifyDpcRoutine ordering).
+    // ORDER MATTERS (VidSch livelock, review round 6, 2026-11-17).
+    //
+    // 1. FIRST drain the used ring and retire every WDDM submission whose
+    //    Venus watermark has been reached. Retirement reports
+    //    DXGK_INTERRUPT_DMA_COMPLETED through DxgkCbNotifyInterrupt at DIRQL
+    //    (DxgkCbSynchronizeExecution); that updates dxgmms2's ISR-side node
+    //    state WITHOUT taking the VidSch scheduler spinlock.
+    // 2. THEN call DxgkCbNotifyDpc, which acquires that scheduler spinlock.
+    //
+    // The old order (NotifyDpc first) deadlocked into a livelock: the VidSch
+    // worker holds the scheduler lock while it waits (polling the ISR-side
+    // state via KeSynchronizeExecution) for a node to regain credits, i.e. for
+    // a DMA completion. Our only completion source while the worker is
+    // spinning is this DPC, and it parked in KxWaitForLockOwnerShip inside
+    // VidSchDdiNotifyDpc BEFORE it ever reported the completion. Real hardware
+    // never hits this because its ISR reports completions independently of
+    // the DPC; this ordering restores that ISR-before-DPC contract. Seen in
+    // freeze-probe3 dumps of runs 7/11/12/14 (worker in VidSchiSelectContext,
+    // other CPUs in KxWaitForLockOwnerShip from VidSchDdiNotifyDpc).
+    //
+    // drain_used_and_complete takes only Helios locks (virtio device lock,
+    // wddm_notify_lock) and never dxgkrnl's, and neither is held across the
+    // NotifyDpc call below, so no new lock-order edge is introduced. Packets it
+    // queues are consumed by the NotifyDpc call right after (and the notify
+    // routine's own DxgkCbQueueDpc still re-runs this DPC as before).
+    drain_used_and_complete(adapter);
+
     if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
         if let Some(notify_dpc) = dxgkrnl.DxgkCbNotifyDpc {
             // SAFETY: DISPATCH_LEVEL DPC context; live device handle.
             unsafe { notify_dpc(dxgkrnl.DeviceHandle) };
         }
     }
-
-    // Drain the used ring, wake ctrl/fence waiters, and retire every WDDM
-    // submission whose Venus watermark has been reached.
-    drain_used_and_complete(adapter);
 }
 
 /// `DxgkDdiControlInterrupt` — enable/disable a class of GPU interrupts. Called at
