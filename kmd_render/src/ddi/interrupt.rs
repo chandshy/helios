@@ -9,8 +9,9 @@
 //! DPC via `DxgkCbQueueDpc`. The drain DPC retires WDDM fences
 //! (`DXGK_INTERRUPT_DMA_COMPLETED` at DIRQL via `signal_dma_completed`) and
 //! never calls `DxgkCbNotifyDpc`. dxgkrnl's DPC (`dxgkddi_dpc_routine`)
-//! drains again if needed and then calls NotifyDpc, or skips NotifyDpc
-//! when the drain reported nothing.
+//! drains again if needed and then ALWAYS calls NotifyDpc once (Round 12:
+//! 9002 skipped it on a zero drain, which starved VidSch of every packet
+//! the drain DPC, PreemptCommand and the VSync heartbeat had queued).
 //!
 //! IRQL: the ISR runs at the device's DIRQL — no allocations, no spinlocks, no
 //! pageable calls; it touches only the lock-free published ISR-status VA, the
@@ -60,9 +61,9 @@ pub(crate) fn request_wddm_completion_dpc(adapter: &AdapterContext) {
 ///
 /// Returns the number of `DXGK_INTERRUPT_DMA_COMPLETED` packets actually
 /// delivered through `DxgkCbNotifyInterrupt` during this call (stale-skipped
-/// fences do not count). The DPC uses a zero return to skip `DxgkCbNotifyDpc`
-/// so it cannot park inside VidSch's scheduler lock when there is nothing for
-/// the worker to observe (Round 9/10 livelock).
+/// fences do not count). The drain-only DPC uses the count to decide whether
+/// to re-queue dxgkrnl's DPC; `dxgkddi_dpc_routine` must NOT use it to skip
+/// `DxgkCbNotifyDpc` (Round 12).
 ///
 /// The bind application lives HERE rather than in `drain_used` because of the
 /// lock order — see the comment on it below.
@@ -421,37 +422,36 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     // wddm_notify_lock) and never dxgkrnl's, and neither is held across the
     // NotifyDpc call below, so no new lock-order edge is introduced.
     //
-    // ROUND 9 / 10: do not call NotifyDpc when this drain reported no
-    // DMA_COMPLETED packets. NotifyDpc acquires the VidSch scheduler
-    // spinlock; the worker may already hold it while polling ISR-side
-    // state via KeSynchronizeExecution (freeze-probe3-run20: CPU 2 in
-    // VidSchDdiNotifyDpc+0x1df, CPU 4 in KeSynchronizeExecution inside
-    // SelectContext). If we park this DPC in that wait, it never returns,
-    // so a later virtio used-ring interrupt can only DxgkCbQueueDpc and
-    // cannot be drained. Skipping NotifyDpc on a zero report lets the DPC
-    // finish; a later ISR can queue a fresh one. After a non-zero report,
-    // ISR-side state is already updated, so the worker can drop the lock
-    // and NotifyDpc can complete; then drain once more in case used-ring
-    // entries arrived while NotifyDpc ran. Bounded to the WDDM FIFO depth
-    // so a pathological notify loop cannot spin the DPC forever.
+    // ROUND 12 (2026-11-18): ALWAYS call DxgkCbNotifyDpc exactly once per
+    // DxgkDdiDpcRoutine. Do NOT gate it on this DPC's own drain count.
     //
-    // Packets a non-zero drain queues are consumed by the NotifyDpc call
-    // right after (and the notify routine's own DxgkCbQueueDpc still
-    // re-runs this DPC as before).
-    const MAX_NOTIFY_PASSES: u32 = 256;
-    for _ in 0..MAX_NOTIFY_PASSES {
-        let reported = drain_used_and_complete(adapter);
-        if reported == 0 {
-            return;
+    // 22.22.259.9002 returned early when `drain_used_and_complete` reported
+    // 0. That broke the WDDM contract ("DxgkDdiDpcRoutine must call
+    // DxgkCbNotifyDpc"): VidSch only consumes the packets queued by
+    // DxgkCbNotifyInterrupt inside NotifyDpc, and most packets do NOT come
+    // from this drain:
+    //   - DMA_COMPLETED drained by `wddm_completion_dpc_routine` (Part B),
+    //     which then only DxgkCbQueueDpc's this routine -- whose own drain
+    //     then finds nothing and skipped NotifyDpc;
+    //   - DMA_PREEMPTED from DxgkDdiPreemptCommand (`notify_at_dirql`);
+    //   - CRTC_VSYNC from the VSync heartbeat (flip / present retirement);
+    //   - immediate DMA_COMPLETED from the SubmitCommand path.
+    // Run 21 (9002) froze with no CPU in VidSchDdiNotifyDpc at all, i.e.
+    // NotifyDpc had stopped being called, not just stuck.
+    //
+    // Part B (the driver-owned completion DPC queued from the ISR) stays:
+    // it keeps draining the used ring and publishing DMA_COMPLETED at
+    // DIRQL even while this routine is parked in NotifyDpc, which is the
+    // piece that matches real hardware. A completion that arrives while
+    // NotifyDpc runs is handled by that DPC, whose notify pair re-queues
+    // this routine, so no re-drain loop is needed here.
+    let _ = drain_used_and_complete(adapter);
+    if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+        if let Some(notify_dpc) = dxgkrnl.DxgkCbNotifyDpc {
+            // SAFETY: DISPATCH_LEVEL DPC context; live device handle. No
+            // Helios lock is held across this call.
+            unsafe { notify_dpc(dxgkrnl.DeviceHandle) };
         }
-        if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
-            if let Some(notify_dpc) = dxgkrnl.DxgkCbNotifyDpc {
-                // SAFETY: DISPATCH_LEVEL DPC context; live device handle.
-                unsafe { notify_dpc(dxgkrnl.DeviceHandle) };
-                continue;
-            }
-        }
-        return;
     }
 }
 
