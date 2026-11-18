@@ -4,15 +4,18 @@
 //! triggered: it asserts the shared INTx line when it pushes used-ring entries
 //! and keeps it asserted until the driver reads the read-to-clear virtio
 //! ISR-status register. The ISR reads that register (deasserting the line),
-//! claims the interrupt, and queues the DPC via `DxgkCbQueueDpc`; the DPC
-//! drains the used ring under the device spinlock (`VirtioGpu::drain_used` —
-//! signaling sync/fence KEVENT waiters) and then completes every WDDM
-//! submission whose venus watermark has been reached
-//! (`DXGK_INTERRUPT_DMA_COMPLETED` at DIRQL via `signal_dma_completed`).
+//! claims the interrupt, and queues two DPCs: a driver-owned drain-only DPC
+//! (`wddm_completion_dpc`, inserted with `KeInsertQueueDpc`) and dxgkrnl's
+//! DPC via `DxgkCbQueueDpc`. The drain DPC retires WDDM fences
+//! (`DXGK_INTERRUPT_DMA_COMPLETED` at DIRQL via `signal_dma_completed`) and
+//! never calls `DxgkCbNotifyDpc`. dxgkrnl's DPC (`dxgkddi_dpc_routine`)
+//! drains again if needed and then calls NotifyDpc, or skips NotifyDpc
+//! when the drain reported nothing.
 //!
 //! IRQL: the ISR runs at the device's DIRQL — no allocations, no spinlocks, no
-//! pageable calls; it touches only the lock-free published ISR-status VA and
-//! the saved dxgkrnl callback table. The DPC runs at DISPATCH_LEVEL.
+//! pageable calls; it touches only the lock-free published ISR-status VA, the
+//! already-initialized drain KDPC, and the saved dxgkrnl callback table. It
+//! never takes `wddm_notify_lock`. Both DPCs run at DISPATCH_LEVEL.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -34,6 +37,9 @@ pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// the prompt that lets it observe the now-ready head without waiting for an
 /// unrelated virtio interrupt.
 pub(crate) fn request_wddm_completion_dpc(adapter: &AdapterContext) {
+    // The driver-owned drain DPC can run even if dxgkrnl's NotifyDpc DPC is
+    // already parked on the scheduler lock. Queue it first.
+    adapter.queue_wddm_completion_dpc();
     let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
         return;
     };
@@ -355,6 +361,15 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     // Bit 0 = used-ring progress (drain), bit 1 = config change: either needs the
     // DPC. (The ISR-status read above already deasserted the line for both.)
     if status & 0x3 != 0 {
+        // Part B: queue the drain-only DPC first. This is the only work the
+        // ISR does toward completions — it does not take wddm_notify_lock
+        // or virtio_lock (locks.rs: the ISR must never acquire the notify
+        // lock; virtio_lock is a DISPATCH lock and cannot be taken at
+        // DIRQL on the same CPU as a holder). The drain DPC runs at
+        // DISPATCH, uses drain_used_and_complete as usual, and never
+        // calls NotifyDpc, so it can run on another CPU while
+        // dxgkddi_dpc_routine is parked in VidSchDdiNotifyDpc.
+        adapter.queue_wddm_completion_dpc();
         if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
             if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
                 // SAFETY: DxgkCbQueueDpc is callable from the ISR at DIRQL;
@@ -437,6 +452,48 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
             }
         }
         return;
+    }
+}
+
+/// Drain-only DPC queued by the ISR (`queue_wddm_completion_dpc`).
+///
+/// Runs at DISPATCH_LEVEL. It retires WDDM fences through
+/// `drain_used_and_complete` (which takes Helios locks at DISPATCH, never
+/// at DIRQL) and does **not** call `DxgkCbNotifyDpc`. After a non-zero
+/// report it asks dxgkrnl to run `dxgkddi_dpc_routine` so NotifyDpc can
+/// consume the packets. The drain loop covers the case where
+/// `KeInsertQueueDpc` returned FALSE because this DPC was already running
+/// when a later ISR fired.
+pub unsafe extern "C" fn wddm_completion_dpc_routine(
+    _dpc: *mut wdk_sys::KDPC,
+    context: *mut core::ffi::c_void,
+    _arg1: *mut core::ffi::c_void,
+    _arg2: *mut core::ffi::c_void,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: context is the adapter pointer passed to KeInitializeDpc in
+    // init_kernel_events; StopDevice/Drop flush this DPC before freeing it.
+    let adapter = unsafe { &*(context as *const AdapterContext) };
+    const MAX_DRAIN_PASSES: u32 = 256;
+    let mut reported = 0u32;
+    for _ in 0..MAX_DRAIN_PASSES {
+        let n = drain_used_and_complete(adapter);
+        if n == 0 {
+            break;
+        }
+        reported = reported.saturating_add(n);
+    }
+    if reported == 0 {
+        return;
+    }
+    if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+        if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+            // SAFETY: DISPATCH_LEVEL, live device handle; QueueDpc does not
+            // take wddm_notify_lock.
+            unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+        }
     }
 }
 

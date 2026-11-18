@@ -428,10 +428,13 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         adapter
             .isr_status
             .store(0, core::sync::atomic::Ordering::Release);
-        // Cancel the display-half VSync heartbeat + join the HPD worker before
-        // teardown (both idempotent; no-ops when the render-only surface never
-        // started them). stop_hpd blocks until the worker exits so it can't touch
-        // the (about-to-be-torn-down) context.
+        // After the ISR gate is down, flush the drain-only completion DPC
+        // so it cannot run drain_used_and_complete once the transport is
+        // dropped below. Then cancel the display-half VSync heartbeat +
+        // join the HPD worker (both idempotent; no-ops when the render-only
+        // surface never started them). stop_hpd blocks until the worker
+        // exits so it can't touch the (about-to-be-torn-down) context.
+        adapter.quiesce_wddm_completion_dpc();
         adapter.stop_vsync();
         adapter.stop_hpd();
         // AFTER stop_hpd, so the worker can no longer re-publish into the state

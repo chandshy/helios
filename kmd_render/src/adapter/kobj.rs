@@ -1,6 +1,6 @@
-//! The five embedded kernel dispatcher objects and their lifecycles: the venus
-//! and scanout mutexes, the HPD worker's wake/exit events and thread, and the
-//! VSync heartbeat timer/DPC pair.
+//! The embedded kernel dispatcher objects and their lifecycles: the venus
+//! and scanout mutexes, the HPD worker's wake/exit events and thread, the
+//! VSync heartbeat timer/DPC pair, and the WDDM drain-only completion DPC.
 //!
 //! Moved verbatim out of `adapter.rs` by T8/R1101 and, for the DPC itself, out
 //! of `ddi/start_device.rs` by T8/R1102. Co-locating `start_vsync`,
@@ -402,6 +402,41 @@ impl AdapterContext {
     /// `self` must be at its final address and not yet visible to any other
     /// thread. PASSIVE_LEVEL only: it allocates the optional system
     /// high-resolution timer exactly once, before this context is published.
+    /// Insert the drain-only WDDM completion DPC. Callable at <= DIRQL,
+    /// including from the ISR. Does not take `wddm_notify_lock` or
+    /// `virtio_lock`; it only touches the already-initialized KDPC.
+    ///
+    /// A FALSE return from `KeInsertQueueDpc` means the DPC is already
+    /// queued or running. The running callback loops
+    /// `drain_used_and_complete` until a pass reports no DMA_COMPLETED, so
+    /// a used-ring entry that arrives mid-run is still retired.
+    pub(crate) fn queue_wddm_completion_dpc(&self) {
+        // SAFETY: `wddm_completion_dpc` was initialized in place by
+        // `init_kernel_events` at this adapter's final address; KeInsertQueueDpc
+        // is legal at PASSIVE, DISPATCH, and DIRQL.
+        let _ = unsafe {
+            wdk_sys::ntddk::KeInsertQueueDpc(
+                self.wddm_completion_dpc.get(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+    }
+
+    /// Remove a pending drain DPC and wait for a running one to finish.
+    /// PASSIVE_LEVEL only (StopDevice / RemoveDevice). Call after the ISR
+    /// gate (`isr_status`) is cleared so the ISR cannot re-insert, and
+    /// before the virtio transport is dropped.
+    pub(crate) fn quiesce_wddm_completion_dpc(&self) {
+        // SAFETY: the KDPC was initialized in place at this address;
+        // KeRemoveQueueDpc is legal at <= DIRQL, and KeFlushQueuedDpcs is
+        // the same PASSIVE drain already used by `quiesce_vsync`.
+        unsafe {
+            let _ = wdk_sys::ntddk::KeRemoveQueueDpc(self.wddm_completion_dpc.get());
+            wdk_sys::ntddk::KeFlushQueuedDpcs();
+        }
+    }
+
     pub unsafe fn init_kernel_events(&self) {
         // SAFETY: per the fn contract; SynchronizationEvent (type 1), initially
         // signaled (the mutex starts free).
@@ -427,6 +462,14 @@ impl AdapterContext {
             wdk_sys::ntddk::KeInitializeDpc(
                 self.vsync_dpc.get(),
                 Some(vsync_dpc_routine),
+                self as *const _ as PVOID,
+            );
+            // Drain-only DPC: initialized at the same immovable address as
+            // the VSync DPC, before publication. The ISR inserts it; it is
+            // never moved.
+            wdk_sys::ntddk::KeInitializeDpc(
+                self.wddm_completion_dpc.get(),
+                Some(crate::ddi::interrupt::wddm_completion_dpc_routine),
                 self as *const _ as PVOID,
             );
             wdk_sys::ntddk::KeInitializeTimerEx(

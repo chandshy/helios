@@ -532,6 +532,17 @@ pub struct AdapterContext {
     /// paths. Only armed when `display_half`.
     pub vsync_timer: UnsafeCell<KTIMER>,
     pub vsync_dpc: UnsafeCell<KDPC>,
+    /// Driver-owned drain DPC (Round 10 Part B). The ISR inserts this at
+    /// DIRQL with `KeInsertQueueDpc` so used-ring retirement and
+    /// `DxgkCbNotifyInterrupt(DMA_COMPLETED)` can run on a *different* CPU
+    /// while dxgkrnl's `DxgkCbNotifyDpc` DPC is parked on the VidSch
+    /// scheduler lock. This DPC never calls `DxgkCbNotifyDpc`, so it cannot
+    /// join that wait, and it never takes `wddm_notify_lock` at DIRQL (the
+    /// ISR only inserts the DPC; the callback runs at DISPATCH and uses the
+    /// existing `drain_used_and_complete` path). Initialized in place by
+    /// [`Self::init_kernel_events`]; flushed in StopDevice/Drop before the
+    /// context is freed.
+    pub wddm_completion_dpc: UnsafeCell<KDPC>,
     /// `PEX_TIMER` returned by `ExAllocateTimer`, stored as an integer so the
     /// stable adapter context remains `Sync`. Zero means allocation failed and
     /// the embedded `KTIMER` fallback is active for this adapter's lifetime.
@@ -987,9 +998,10 @@ impl AdapterContext {
     /// it.
     ///
     /// This is the ONLY way to obtain an `AdapterContext`, and it deliberately
-    /// never returns `Self`. `new` builds five self-referential kernel
+    /// never returns `Self`. `new` builds the self-referential kernel
     /// dispatcher objects as zeroed placeholders (`scanout_mutex`,
-    /// `venus_mutex`, `vsync_timer`, `vsync_dpc`, `hpd_event`), so the real
+    /// `venus_mutex`, `vsync_timer`, `vsync_dpc`, `wddm_completion_dpc`,
+    /// `hpd_event`), so the real
     /// headers can only be written once the context is at its final heap
     /// address. As two public steps, this compiled:
     ///
@@ -1071,6 +1083,7 @@ impl AdapterContext {
             // the context reaches its final address, before publication.
             vsync_timer: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_dpc: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            wddm_completion_dpc: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_ex_timer: AtomicUsize::new(0),
             vsync_deadline_100ns: AtomicU64::new(0),
             vsync_enabled: AtomicU32::new(0),
@@ -1600,6 +1613,7 @@ impl Drop for AdapterContext {
         // PASSIVE_LEVEL (RemoveDevice).
         self.stop_vsync();
         self.delete_vsync_ex_timer();
+        self.quiesce_wddm_completion_dpc();
         self.stop_hpd();
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory
