@@ -257,6 +257,14 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) -> u32 {
             // 1–3 ms bucket 0.6 % → 5.0 %, duplicate-content reads 3.5 % → 9.1 %
             // on 22.22.215.0). The ordering the frames actually need is the
             // ownership gate on the flush executor, not a completion policy.
+            // 22.22.259.9004: a deferred DxgkDdiPreemptCommand is acknowledged
+            // as soon as no fence older than its preemption fence is pending
+            // (and before any completion forward of it is reported).
+            if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+                if super::submit_command::settle_pending_preempt_locked(guard, dxgkrnl) {
+                    reported = reported.saturating_add(1);
+                }
+            }
             let taken = guard
                 .with_virtio(|o, v| v.take_one_ready_wddm(o))
                 .unwrap_or(crate::virtio::WddmTake::Empty);

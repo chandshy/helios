@@ -26,6 +26,11 @@ pub static SUBMIT_LAST_FENCE: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PATCH_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// DxgkDdiPreemptCommand requests that could not be acknowledged inside the
+/// DDI because submitted fences were still executing (22.22.259.9004).
+pub static PREEMPT_DEFERRED: AtomicU32 = AtomicU32::new(0);
+/// DMA_PREEMPTED packets delivered (immediate or deferred).
+pub static PREEMPT_ACKED: AtomicU32 = AtomicU32::new(0);
 pub static DMA_NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_QUEUE_DPC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_SYNC_STATUS_LOW: AtomicU32 = AtomicU32::new(0);
@@ -378,9 +383,12 @@ pub(crate) unsafe fn signal_crtc_vsync(
     unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
 }
 
-/// Signal `DXGK_INTERRUPT_DMA_PREEMPTED` (see [`notify_at_dirql`]): the node's
-/// pending submissions are released back to the scheduler, which resubmits the
-/// incomplete ones later.
+/// Signal `DXGK_INTERRUPT_DMA_PREEMPTED` (see [`notify_at_dirql`]).
+///
+/// Called only from [`settle_pending_preempt_locked`], i.e. once every fence
+/// submitted before the preemption request has been reported with
+/// DMA_COMPLETED. `LastCompletedFenceId` is therefore the real completion
+/// watermark and dxgkrnl has nothing to resubmit (no replay of executed work).
 unsafe fn signal_dma_preempted_locked(
     guard: &WddmNotifyGuard<'_>,
     dxgkrnl: &DXGKRNL_INTERFACE,
@@ -396,6 +404,49 @@ unsafe fn signal_dma_preempted_locked(
     preempted.EngineOrdinal = 0;
     // SAFETY: fully-initialized packet, live for the call.
     unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+}
+
+/// Acknowledge a deferred DxgkDdiPreemptCommand once it is allowed (22.22.259.9004).
+///
+/// WDK, `DxgkDdiPreemptCommand` remarks: the driver reports the preemption
+/// through `DxgkCbNotifyInterrupt` with `DXGK_INTERRUPT_DMA_PREEMPTED`, filling
+/// `PreemptionFenceId` and `LastCompletedFenceId`; it may do so from inside the
+/// DDI only if the hardware has already finished all submitted DMA buffers and
+/// has informed the scheduler about those completions. Helios cannot abort host
+/// venus work, so its preemption boundary is "everything already submitted has
+/// retired": the acknowledgement waits until the pending FIFO holds no fence
+/// older than the preemption fence.
+///
+/// Must run under the notify lock BEFORE any DMA_COMPLETED for a fence that is
+/// forward of the preemption fence, so the scheduler sees the fence stream in
+/// order. Returns true when a DMA_PREEMPTED packet was delivered.
+pub(crate) fn settle_pending_preempt_locked(
+    guard: &WddmNotifyGuard<'_>,
+    dxgkrnl: &DXGKRNL_INTERFACE,
+) -> bool {
+    let Some(preemption_fence) = guard.pending_preempt() else {
+        return false;
+    };
+    let head = guard
+        .with_virtio(|o, v| v.wddm_head_fence(o))
+        .unwrap_or(None);
+    if !helios_kmd_logic::preempt_ack::ready(preemption_fence, head) {
+        return false;
+    }
+    // SAFETY: notify lock held (guard); dxgkrnl callback table is live.
+    let status = unsafe { signal_dma_preempted_locked(guard, dxgkrnl, preemption_fence) };
+    if status == STATUS_SUCCESS {
+        guard.clear_pending_preempt();
+        PREEMPT_ACKED.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+        if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+            // SAFETY: callable at <= DIRQL; does not take the notify lock.
+            unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+        }
+        false
+    }
 }
 
 /// Common submission handling (C3/M3.4): record the WDDM fence behind the venus
@@ -457,6 +508,9 @@ fn note_and_maybe_signal(
             // Transport down (bring-up / teardown): no venus work can gate it.
             .unwrap_or(true);
         if signal_now {
+            // A deferred preemption request precedes this fence in VidSch's
+            // fence stream; acknowledge it first (FIFO is empty here).
+            let _ = settle_pending_preempt_locked(guard, dxgkrnl);
             // SAFETY: the notification lock is held and dxgkrnl is live.
             let status = unsafe { signal_dma_completed(guard, dxgkrnl, fence) };
             if status != STATUS_SUCCESS {
@@ -807,7 +861,9 @@ pub static ABANDONED_FENCES: AtomicU32 = AtomicU32::new(0);
 
 /// What the caller owes VidSch after the pending fences are dropped.
 ///
-/// The three TDR-adjacent DDIs perform the SAME "take the notify lock, drop
+/// Since 22.22.259.9004 DxgkDdiPreemptCommand no longer drops anything (see
+/// [`settle_pending_preempt_locked`]); only the two reset DDIs abandon the
+/// epoch. The two reset DDIs perform the SAME "take the notify lock, drop
 /// every pending WDDM fence" step and then do three different things
 /// afterwards, with the shared step named nowhere. Making the difference an
 /// exhaustive value forces any future TDR-adjacent DDI to declare which
@@ -816,11 +872,6 @@ pub(crate) enum AbandonOutcome<'a> {
     /// `DxgkDdiResetFromTimeout`: dxgkrnl owns the post-reset fence state and
     /// wants no packet.
     Silent,
-    /// `DxgkDdiPreemptCommand`: acknowledge with a `DMA_PREEMPTED` packet.
-    Preempted {
-        dxgkrnl: &'a DXGKRNL_INTERFACE,
-        fence: u32,
-    },
     /// `DxgkDdiResetEngine`: report the completed watermark.
     ReportLastAborted { out: &'a mut UINT },
 }
@@ -856,32 +907,20 @@ pub(crate) fn abandon_pending_submissions(
     // primary address and signals the display worker, and neither belongs
     // inside a DISPATCH notification lock.
     adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Teardown);
-    // Preemption is the sole replayable scheduler outcome: dxgkrnl resubmits
-    // the same private record after it re-establishes residency. Reset and
-    // timeout abandon the epoch, so their WindowedBlt readers must be settled
-    // or retained only through an already-dispatched host response.
-    let retain_for_resubmit = matches!(&outcome, AbandonOutcome::Preempted { .. });
+    // Reset and timeout abandon the epoch, so their WindowedBlt readers must be
+    // settled or retained only through an already-dispatched host response.
     adapter.with_wddm_notify_lock(|guard| {
+        // A reset supersedes any preemption still waiting for its fences:
+        // dxgkrnl discards the outstanding work and wants no DMA_PREEMPTED.
+        guard.clear_pending_preempt();
         let dropped = guard
-            .with_virtio(|o, v| {
-                if retain_for_resubmit {
-                    v.preempt_flush(o)
-                } else {
-                    v.terminal_abandon_wddm_epoch(o)
-                }
-            })
+            .with_virtio(|o, v| v.terminal_abandon_wddm_epoch(o))
             .unwrap_or(0);
         if dropped != 0 {
             ABANDONED_FENCES.fetch_add(dropped, Ordering::Relaxed);
         }
         let status = match outcome {
             AbandonOutcome::Silent => STATUS_SUCCESS,
-            AbandonOutcome::Preempted { dxgkrnl, fence } => {
-                // SAFETY: the WDDM notification lock serializes this packet with
-                // every DMA_COMPLETED packet; the callback interface is live and
-                // delivery is raised to DIRQL by notify_at_dirql.
-                unsafe { signal_dma_preempted_locked(guard, dxgkrnl, fence) }
-            }
             AbandonOutcome::ReportLastAborted { out } => {
                 // Written INSIDE the guard, exactly as before. Do NOT change the
                 // value: whether DXGKARG_RESETENGINE wants the completed
@@ -896,12 +935,23 @@ pub(crate) fn abandon_pending_submissions(
 }
 
 /// `DxgkDdiPreemptCommand` — VidSch wants the node's pending submissions back
-/// (TDR probe or priority scheduling). We cannot abort host venus work, but we
-/// CAN release the pending WDDM fences: drop them (the scheduler resubmits the
-/// incomplete DMA buffers later; the venus work keeps executing and the fresh
-/// submissions re-queue behind whatever is still outstanding) and acknowledge
-/// with `DMA_PREEMPTED`. Without this ack, a validate-slow venus fence
-/// (> TdrDelay) escalates straight to ResetFromTimeout. Runs at DISPATCH_LEVEL.
+/// (TDR probe or priority scheduling). Runs at DISPATCH_LEVEL.
+///
+/// 22.22.259.9004: WDK-conformant deferred acknowledgement. Helios cannot
+/// abort host venus work, so it must not claim the work was preempted while it
+/// is still executing. Until 9003 this DDI dropped every pending WDDM fence and
+/// sent DMA_PREEMPTED from inside the call; the WDK permits that only when all
+/// submitted DMA buffers have already completed and been reported. Dropping
+/// executing fences also made dxgkrnl resubmit (replay) DMA buffers whose venus
+/// work the host was still running.
+///
+/// Now the request is recorded and acknowledged by
+/// [`settle_pending_preempt_locked`]: immediately when nothing submitted is
+/// outstanding (the case the WDK allows), otherwise from the completion DPC
+/// once the last outstanding fence retires, with `LastCompletedFenceId` = that
+/// real fence. If venus work stays busy past TdrDelay, VidSch escalates to
+/// DxgkDdiResetFromTimeout, which is the documented outcome for an engine that
+/// does not reach its preemption boundary in time.
 pub unsafe extern "C" fn dxgkddi_preempt_command(
     h_adapter: *mut c_void,
     preempt_command: *const DXGKARG_PREEMPTCOMMAND,
@@ -917,17 +967,15 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
         Ok(interface) => interface,
         Err(_) => return STATUS_DEVICE_NOT_READY,
     };
-    // The one-critical-section rationale now lives on
-    // `abandon_pending_submissions`, where DxgkDdiResetEngine's reader can see
-    // it too.
-    abandon_pending_submissions(
-        adapter,
-        AbandonOutcome::Preempted {
-            dxgkrnl,
-            fence: preempt.PreemptionFenceId,
-        },
-    )
-    .1
+    adapter.with_wddm_notify_lock(|guard| {
+        // VidSch does not issue a second preemption on a node while one is in
+        // flight; if it ever did, the newer fence supersedes the older one.
+        guard.set_pending_preempt(preempt.PreemptionFenceId);
+        if !settle_pending_preempt_locked(guard, dxgkrnl) {
+            PREEMPT_DEFERRED.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiResetFromTimeout` — TDR recovery. There is no hardware engine state

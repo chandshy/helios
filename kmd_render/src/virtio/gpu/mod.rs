@@ -6452,24 +6452,13 @@ impl VirtioGpu {
         self.wddm_pending.push_front(ready.pending);
     }
 
-    /// Preemption: drop every pending WDDM submission (dxgkrnl resubmits the
-    /// unfinished DMA buffers with fresh fence ids after the preempt completes;
-    /// the underlying venus work keeps executing host-side). Returns the count
-    /// dropped.
-    pub fn preempt_flush(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> u32 {
-        let n = self.wddm_pending.len() as u32;
-        self.wddm_pending.clear();
-        // Scheduler residency admission was revoked. A request that has not
-        // reached ring 1 must await the resubmitted DMA buffer's exact token;
-        // dispatching it merely because its producer happened to retire would
-        // race destination paging.
-        for request in self.windowed_blt.pending.iter_mut() {
-            if !request.dispatched {
-                request.admitted = false;
-            }
-        }
-        self.windowed_blt.ready.clear();
-        n
+    /// Oldest submitted-but-not-yet-reported WDDM fence, or `None` when every
+    /// submitted fence has been reported complete. The deferred DMA_PREEMPTED
+    /// acknowledgement (22.22.259.9004) waits on this instead of dropping the
+    /// FIFO: the old `preempt_flush` discarded fences whose venus work was still
+    /// executing and made dxgkrnl resubmit (replay) those DMA buffers.
+    pub fn wddm_head_fence(&self, _order: &crate::adapter::NotifyOrdered<'_>) -> Option<u32> {
+        self.wddm_pending.front().map(|head| head.fence)
     }
 
     /// Scanout-0 preferred `(width, height)` from the host's `GET_DISPLAY_INFO` at
